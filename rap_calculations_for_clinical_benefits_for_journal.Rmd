@@ -1,0 +1,683 @@
+---
+params:
+  Ancestry: "AFR" #"EUR" #"AFR" #   "EUR" # 
+---
+
+### Outline of process
+
+#### Parameter Ancestry is currently either EUR (use WHITE SIRE) or AFR (use BLACK SIRE).  
+
+The log(OR) per sd of PRS (beta) is the first input.  
+The beta is used to find the smallest PRS such that the OR would be >=2. 
+From this, we find the proportion of the PRS for which OR>2. 
+The beta and this proportion are used to find the mean OR for those within the OR>2 group.  
+
+Baselines for the US population. 
+The stated reference age (t0) is taken from the agreed list
+
+Look up the baseline incidence at the reference age.  
+
+risk_group_incidence(t) = baseline_incidence(t) * RR   
+Need to find t such that risk_group_incidence(t) = baseline_incidence(t0)   
+  baseline_incidence(t)*RR = baseline_incidence(t0)  
+  baseline_incidence(t) = baseline_incidence(t0) / RR ; this is the target incidence rate  
+  Search for the youngest value of t such that this is true - this is the equivalent_age  
+reference_age - equivalent_age = RAP  
+
+Randomly sample 10,000 PRSs from the truncated N(0,1) distribution starting at the minimum PRS for which OR>=2  
+Run internal integrated risk tool using the baseline incidence file, the beta (log(OR) per SD), the equivalent_age as the starting age and the RAP as the risk duration.  
+This calculates risks for the baseline (no PRS effect) model, and for the baseline+PRS model.  
+Assumes all subjects are either White SIRE and have EUR ancestry, or are Black SIRE and AFR ancestry, as per parameter.  
+
+Use the IRT output to find the mean predicted risk between the equivalent age and the reference age among people in the high risk (OR>2) group.  
+Multiplying the mean risk in this group by the proportion of the population who would be in this group gives the expected number of cases (e.g. per 100,000 population of that sex) which could occur between these time points among members of the high risk group.  
+This is compared to the number of cases which would be expected to occur between these time points in the population as a whole, based on the population baseline incidences.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE, fig.width = 4, fig.height = 3, dpi = 300, out.width='100%', eval = TRUE, results='asis')
+
+source("utilities.R", local = knitr::knit_global())
+
+myanc <- params$Ancestry
+if(myanc=="AFR") myanc <- "AFR_SS"
+
+if(myanc=="AFR_SS") {
+  mysire <- "Black"
+} else if(myanc=="EUR") {
+  mysire <- "White"
+}
+
+palette_gplc_hex["lightgreen"] <- "#2bcc9e"
+
+```
+
+US baseline eith the addition of the new OC AAA baseline based on UKBiobank data
+
+#### Assemble the basic information for the diseases
+
+The OR per SD of PRS is the HR estimated in a bespoke testing set for this project.  
+```{r basic information per disease}
+
+disease <-  Cs(AAA, BC, BC, COPD, CRC, CRC, HCAD_MIE, HCAD_MIE,  HT,  OC, PC, T2D) # without MEL or AF
+age0 <-      c(65,  50, 40, 55,   50,  45,  50,       40,        40,  50, 55, 35) 
+dat <- data.frame(disease, age0)
+dat <- mutate(dat, sex = ifelse(disease %in% c("BC", "OC"), "female", ifelse(disease=="PC", "male", "other")))
+
+# Arvados uuids for baseline collections
+baseline_glons <- fread(file = "US_baseline_glons.txt", data.table = FALSE)
+baseline_glons <- mutate(baseline_glons, Code = ifelse(Code=="HCAD", "HCAD_MIE", Code))
+dat <- left_join(dat, select(baseline_glons, Code, glon), by = c("disease" = "Code"))
+
+# Data from testing set evaluation
+hr_df <- fread(file = "ClinBen_prs_effect_sizes.csv", data.table = FALSE)
+hr_df <- filter(hr_df, trait_code %in% c(disease, "EOC", "HCAD_PRSmie") & Ancestry==myanc) %>% select(trait_code, lnOdds:UCI)
+hr_df <- mutate(hr_df, trait_code = ifelse(trait_code=="EOC", "OC", 
+                                           ifelse(trait_code=="HCAD_PRSmie", "HCAD_MIE", trait_code)))
+
+dat <- left_join(dat, select(hr_df, trait_code, beta = lnOdds), by = c("disease" = "trait_code"))
+dat <- mutate(dat, disease_code = ifelse(substr(disease, 1, 4)=="HCAD", "HCAD", disease))
+
+# remove those without a baseline or without a PRS
+dat <- filter(dat, !is.na(beta) & !is.na(glon))
+
+
+# If myanc is AFR_SS, then don't include AAA (no baseline), MEL (too rare) or OC (not enough data to train a PRS effect size - the estimate is negative)
+if(myanc=="AFR_SS") dat <- filter(dat, !disease %in% c("AAA", "MEL", "OC"))
+
+```
+
+
+#### Find the minimum PRS required to have an OR of at least 2 or at least 3
+```{r minimum PRS to be high risk}
+
+low <- 0.5 # 0.25 # OR threshold for being in the Low Risk group.
+
+f_min_prs <- function(beta = 0, threshold = 2) {
+  minprs <- (log(threshold) + ((beta^2) / 2)) / beta
+  return(minprs)
+}
+
+dat <- mutate(dat, minprs.2 = f_min_prs(beta, 2), minprs.3 = f_min_prs(beta, 3), minprs.0.5 = f_min_prs(beta, low))
+dat <- mutate(dat, prop.2 = pnorm(minprs.2, lower.tail = FALSE), prop.3 = pnorm(minprs.3, lower.tail = FALSE), prop.0.5 = pnorm(minprs.0.5, lower.tail = TRUE))
+
+```
+
+Here the threshold for being in the Low Risk group is an OR<= `r low`.  
+
+#### Find the baseline incidence at the chosen reference age
+```{r find baseline risk at age0}
+
+f_get_risk0 <- function(i=1, disease = "BC", age0 = 50, ancestry) {
+  
+  # Start by finding the White baselines
+    if(disease=="AAA") {
+      tmp <- f_read_arv(glon = dat[i, "glon"], filename = paste0("UK_", dat[i, "disease_code"] , "_baseline_data.json"))$baseline_data
+      white_name <- "WHITE_SIRE"
+      black_name <- "WHITE_SIRE" # there are no black SIRE incidences, so can't plot this - just include this here to stop it crashing
+    } else {
+      tmp <- f_read_arv(glon = dat[i, "glon"], filename = paste0("USA_", dat[i, "disease_code"] , "_baseline_data.json"))$baseline_data
+      white_name <- "WHITE_NONHISP_SIRE"
+      black_name <- "BLACK_NONHISP_SIRE"
+    }
+    use_female <- NA
+    use_male <- NA
+    use_other <- NA
+    if(ancestry=="EUR") {
+      for(j in 1:length(tmp)) {
+        if(tmp[[j]]$sire==white_name & tmp[[j]]$sex=="female") use_female <- j
+        if(tmp[[j]]$sire==white_name & tmp[[j]]$sex=="male") use_male <- j
+        if(tmp[[j]]$sire==white_name & tmp[[j]]$sex=="other_sex") use_other <- j
+      }
+    } else if(ancestry=="AFR_SS") {
+      for(j in 1:length(tmp)) {
+        if(tmp[[j]]$sire==black_name & tmp[[j]]$sex=="female") use_female <- j
+        if(tmp[[j]]$sire==black_name & tmp[[j]]$sex=="male") use_male <- j
+        if(tmp[[j]]$sire==black_name & tmp[[j]]$sex=="other_sex") use_other <- j
+      }
+    }
+   
+     # incidence rates
+    if(!is.na(use_female) & !is.na(use_male) & !is.na(use_other)) {
+      dat_inc <- data.frame(age_female = tmp[[use_female]]$data$age, inc_female = tmp[[use_female]]$data$incidence,
+                            age_male   = tmp[[use_male]]$data$age,     inc_male = tmp[[use_male]]$data$incidence,
+                            age_other  = tmp[[use_other]]$data$age,   inc_other = tmp[[use_other]]$data$incidence)
+      dat_inc <- mutate(dat_inc, age = ifelse(age_female == age_male & age_female == age_other, age_female, NA)) %>% 
+                 select(-c(age_female, age_male, age_other))
+    } else if(!is.na(use_female)) {
+      dat_inc <- data.frame(age_female = tmp[[use_female]]$data$age, inc_female = tmp[[use_female]]$data$incidence) %>%
+                            mutate(age_male = NA,          inc_male = NA,
+                            age_other = age_female, inc_other = inc_female)
+      dat_inc <- rename(dat_inc, age = age_female)
+    } else if(!is.na(use_male)) {
+      dat_inc <- data.frame(age_male = tmp[[use_male]]$data$age, inc_male = tmp[[use_male]]$data$incidence) %>% 
+                        mutate(age_female = NA,        inc_female = NA,
+                               age_other = age_male,   inc_other = inc_male)
+      dat_inc <- rename(dat_inc, age = age_male)
+    }
+    baseline_incidences <- filter(dat_inc, age>=18 & age<=80)
+  
+    # Baseline risk at age age0
+    risk0_f <- NA
+    risk0_m <- NA
+    risk0_o <- NA
+
+    if(!is.na(use_female)) risk0_f <- filter(dat_inc, age==age0) %>% pull(inc_female)
+    if(!is.na(use_male))   risk0_m <- filter(dat_inc, age==age0) %>% pull(inc_male)
+    if(!is.na(use_other))  risk0_o <- filter(dat_inc, age==age0) %>% pull(inc_other)
+
+    return(list(risk0_f = risk0_f, risk0_m = risk0_m, risk0_o = risk0_o, baseline_incidences = baseline_incidences))
+}
+
+# Use the function to get the baseline risk at age0 for each disease
+baseline_incidences <- list()
+dat <- mutate(dat, risk0_f = NA, risk0_m = NA, risk0_o = NA)
+for(i in seq_along(dat$disease)) {
+  risk0 <- f_get_risk0(i, disease = dat[i, "disease_code"], age0 = dat[i, "age0"], ancestry = myanc) 
+  dat[i, "risk0_f"] <- risk0[["risk0_f"]]
+  dat[i, "risk0_m"] <- risk0[["risk0_m"]]
+  dat[i, "risk0_o"] <- risk0[["risk0_o"]]
+  baseline_incidences[[i]] <- risk0[["baseline_incidences"]]  
+}
+names(baseline_incidences) <- dat$disease
+
+dat <- mutate(dat, risk0 = ifelse(sex=="female", "risk0_f", ifelse(sex=="male", "risk0_m", "risk0_o")))
+
+saveRDS(baseline_incidences, file = paste0("baseline_incidences_", mysire, ".RDS"))
+# also save the summary df with risk at chosen baseline age for all diseases (m, f and o)
+saveRDS(dat, file = paste0("baseline_risks_at_age0_for_all_diseases_",low,"_", mysire, ".RDS"))
+ 
+```
+
+
+#### Functions used in running the baseline incidence rates method
+
+E[exp(b.x - b^2/2)]= pnorm(qnorm(P)+b)/P, where P is the top P proportion of the PRS distribution
+
+It is actually very easy to adjust so that we get the HR or OR in the top P (bottom Q) vs the population mean. The current integral is of exp(bx) but when we correct so that the hazard of an individual is relative to the population mean then we would integrate exp(bx-b^2/2). That extra constant of exp(-b^2/2) will cancel out with exp(b^2/2) such that the solution is pnorm(qnorm(P)+b)/P"
+
+
+```{r functions for RAP}
+
+# get expected RR from within the top PRS %
+f_expected_RR <- function(beta, prop = 0.2, high_or_low = "high") { # beta needs to be the logHR, not the HR!
+    if(high_or_low=="high") {
+      expected_top <- pnorm(qnorm(prop) + beta) / prop # expected RR from truncated normal distributions
+    } else if(high_or_low=="low") {
+      expected_top <- pnorm(qnorm(prop) - beta) / prop # still calling it expected_top, but this is for e.g. the bottom 5%
+    } else {
+      print("Needs to be high or low, not anything else")
+    }
+  return(expected_top)
+}
+
+
+# make annual incidence plots for population mean and a high risk group
+# plots are annotated with lines to show equivalent risk ages
+
+f_inc_plots <- function(baseline, df) {
+ 
+  plot_cols <- c("lightgreen", "purple", "pink", "brown")
+  dotsize <- 0.8
+
+  RR2 <- df$RR2
+  RR3 <- df$RR3
+  RR0.5 <- df$RR0.5
+  sex <- df$sex
+  equiv_age0.2 <- select(df, eval(paste0("equiv_age_", substr(sex, 1, 1), ".2")))[1,1]
+  equiv_age0.3 <- select(df, eval(paste0("equiv_age_", substr(sex, 1, 1), ".3")))[1,1]
+  equiv_age0.0.5 <- select(df, eval(paste0("equiv_age_", substr(sex, 1, 1), ".0.5")))[1,1]
+  target_inc.2 <- 1000*select(df, eval(paste0("target_inc_", substr(sex, 1, 1), ".2")))[1,1]
+  target_inc.3 <- 1000*select(df, eval(paste0("target_inc_", substr(sex, 1, 1), ".3")))[1,1]
+  target_inc.3 <- 1000*select(df, eval(paste0("target_inc_", substr(sex, 1, 1), ".0.5")))[1,1]
+  risk0 <- 1000*select(df, eval(paste0("risk0_", substr(sex, 1, 1))))[1,1] # incidence per 1,000 population
+  
+  # rename the variables and make into a longer format
+  baseline2 <- baseline %>% rename(inc = eval(paste0("inc_", sex))) %>% 
+                mutate(inc_high = inc*RR2, inc_vhigh = inc*RR3, inc_low = inc*RR0.5) %>%
+                pivot_longer(cols = c(inc, inc_high, inc_vhigh, inc_low), names_to = "group", values_to = "incidence") 
+  
+  # Set the group names to match the risk groups
+  highlabel <- "High risk, OR>2"
+  vhighlabel <- "Very high risk, OR>3"
+  lowlabel <- "Low risk, OR<0.5"
+  baseline2 <- baseline2 %>% 
+            mutate(group = fct_recode(group, "Population mean risk" = "inc", 
+                                              "{highlabel}" := "inc_high", 
+                                              "{vhighlabel}" := "inc_vhigh",
+                                              "{lowlabel}" := "inc_low" )) %>% 
+                   mutate(group = fct_relevel(group, "Population mean risk", highlabel, vhighlabel, lowlabel))
+  
+  p_inc <- baseline2 %>%  ggplot(aes(x = age, y = incidence*1000, colour = group)) + 
+                    geom_line(linewidth = dotsize) + 
+                    scale_discrete_gplc(cols = plot_cols) +
+                    mytheme() + labs(x = "Age", subtitle = paste0(df$disease), y = "Annual risk (per 1,000)") + 
+                    coord_cartesian(xlim = c(20,80)) + scale_x_continuous(breaks = seq(20,80,10)) +
+                    guides(color = guide_legend(override.aes = list(size = 2), ncol = 3)) + # makes the dots in the legend larger
+                    theme(legend.box.margin = margin(0.0, 0.1, 0.1, 0.1, unit="in"))
+  
+  ##### to get a simple plot with just the high-risk and average lines
+  if(i==2) {  
+       p1 <- filter(baseline2, group %in% c("Population mean risk", "High risk, RR>2")) %>%  
+                        ggplot(aes(x = age, y = incidence*1000, colour = group)) + 
+                        geom_line(linewidth = dotsize) + 
+                        scale_discrete_gplc(cols = plot_cols <- c("lightgreen", "purple")) +
+                        mytheme() + labs(x = "Age", subtitle = paste0(df$disease), y = "Annual risk (per 1,000)") + 
+                        coord_cartesian(xlim = c(20,80)) + scale_x_continuous(breaks = seq(20,80,10)) +
+                        guides(color = guide_legend(override.aes = list(size = 2), ncol = 3)) + # makes the dots in the legend larger
+                        theme(legend.box.margin = margin(0.0, 0.1, 0.1, 0.1, unit="in"))
+       p1 <- p1 + 
+                annotate("segment", x = equiv_age0.2, xend = df$age0, y = risk0, yend = risk0, colour = palette_gplc_hex["oxfordblue"], linetype = "dashed") +
+                annotate("segment", x = equiv_age0.2, xend = equiv_age0.2,  y = risk0, yend = 0, colour = palette_gplc_hex["purple"])
+       p1 <- p1 + 
+                annotate("segment", x = equiv_age0.0.5, xend = df$age0, y = risk0, yend = risk0, colour = palette_gplc_hex["oxfordblue"], linetype = "dashed") 
+       p1 <- p1 + geom_vline(xintercept = df$age0, colour = palette_gplc_hex["oxfordblue"], linetype = "dashed")
+       ggsave(p1, file = "BC_just_2_lines.png", width = 4, height = 4, dpi = 300)
+  }
+   
+ # add annotation lines unless these are not wanted
+  p_inc <- p_inc + 
+            annotate("segment", x = equiv_age0.2, xend = df$age0, y = risk0, yend = risk0, colour = palette_gplc_hex["oxfordblue"], linetype = "dashed") +
+            annotate("segment", x = equiv_age0.2, xend = equiv_age0.2,  y = risk0, yend = 0, colour = palette_gplc_hex["purple"])
+  p_inc <- p_inc + 
+            annotate("segment", x = equiv_age0.3, xend = df$age0, y = risk0, yend = risk0, colour = palette_gplc_hex["oxfordblue"], linetype = "dashed") +
+            annotate("segment", x = equiv_age0.3, xend = equiv_age0.3,  y = risk0, yend = 0, colour = palette_gplc_hex["pink"])
+  
+  p_inc <- p_inc + 
+            annotate("segment", x = equiv_age0.0.5, xend = df$age0, y = risk0, yend = risk0, colour = palette_gplc_hex["oxfordblue"], linetype = "dashed") 
+  
+  # only add the vertical line for the low risk group if there is a non-infinite equivalent age
+  if(!is.infinite(equiv_age0.0.5)) p_inc <- p_inc + annotate("segment", x = equiv_age0.0.5, xend = equiv_age0.0.5,  y = risk0, yend = 0, colour = palette_gplc_hex["brown"])
+
+  
+  p_inc <- p_inc + geom_vline(xintercept = df$age0, colour = palette_gplc_hex["oxfordblue"], linetype = "dashed")
+
+  return(p_inc)  
+}
+
+```
+
+#### Running the analyses
+```{r run analyses, fig.width = 9, fig.height = 12, dpi = 300}
+dat <- readRDS(file = paste0("baseline_risks_at_age0_for_all_diseases_",low, "_", mysire, ".RDS"))
+ 
+# RR2 and RR3 are the RR for someone with HR>=2 or HR>=3, respectively, relative to the mean incidence
+dat <- mutate(dat, RR2  = f_expected_RR(beta = beta, prop = prop.2), 
+                   RR3  = f_expected_RR(beta = beta, prop = prop.3),
+                   RR0.5  = f_expected_RR(beta = beta, prop = prop.0.5, high_or_low = "low"))
+# target_inc etc are the baseline inc(t) for the t at which incidence in the e.g. top 20% of the PRS matches the baseline incidence at age age_0. 
+dat <- mutate(dat, target_inc_f.2 = risk0_f / RR2, target_inc_m.2 = risk0_m / RR2, target_inc_o.2 = risk0_o / RR2)
+dat <- mutate(dat, target_inc_f.3 = risk0_f / RR3, target_inc_m.3 = risk0_m / RR3, target_inc_o.3 = risk0_o / RR3)
+dat <- mutate(dat, target_inc_f.0.5 = risk0_f / RR0.5, target_inc_m.0.5 = risk0_m / RR0.5, target_inc_o.0.5 = risk0_o / RR0.5)
+
+# After this, need to find the t for which the baseline incidence reaches first this value.
+baseline_incidences <- readRDS(file = paste0("baseline_incidences_", mysire, ".RDS"))
+# find age at which risk in high risk group is equivalent to that of the population mean at age0 reference age
+equiv_age_f.2 <- vector()
+equiv_age_m.2 <- vector()
+equiv_age_o.2 <- vector()
+equiv_age_f.3 <- vector()
+equiv_age_m.3 <- vector()
+equiv_age_o.3 <- vector()
+equiv_age_f.0.5 <- vector()
+equiv_age_m.0.5 <- vector()
+equiv_age_o.0.5 <- vector()
+for(i in seq_along(dat$disease)) {
+  equiv_age_f.2[i] <- filter(baseline_incidences[[dat[i,"disease"]]], inc_female>=dat[i,"target_inc_f.2"]) %>% summarise(equiv_age = min(age)) %>% pull(equiv_age)
+  equiv_age_m.2[i] <- filter(baseline_incidences[[dat[i,"disease"]]], inc_male>=dat[i,"target_inc_m.2"]) %>% summarise(equiv_age = min(age)) %>% pull(equiv_age)
+  equiv_age_o.2[i] <- filter(baseline_incidences[[dat[i,"disease"]]], inc_other>=dat[i,"target_inc_o.2"]) %>% summarise(equiv_age = min(age)) %>% pull(equiv_age)
+  equiv_age_f.3[i] <- filter(baseline_incidences[[dat[i,"disease"]]], inc_female>=dat[i,"target_inc_f.3"]) %>% summarise(equiv_age = min(age)) %>% pull(equiv_age)
+  equiv_age_m.3[i] <- filter(baseline_incidences[[dat[i,"disease"]]], inc_male>=dat[i,"target_inc_m.3"]) %>% summarise(equiv_age = min(age)) %>% pull(equiv_age)
+  equiv_age_o.3[i] <- filter(baseline_incidences[[dat[i,"disease"]]], inc_other>=dat[i,"target_inc_o.3"]) %>% summarise(equiv_age = min(age)) %>% pull(equiv_age)
+  equiv_age_f.0.5[i] <- filter(baseline_incidences[[dat[i,"disease"]]], inc_female>=dat[i,"target_inc_f.0.5"]) %>% summarise(equiv_age = min(age)) %>% pull(equiv_age)
+  equiv_age_m.0.5[i] <- filter(baseline_incidences[[dat[i,"disease"]]], inc_male>=dat[i,"target_inc_m.0.5"]) %>% summarise(equiv_age = min(age)) %>% pull(equiv_age)
+  equiv_age_o.0.5[i] <- filter(baseline_incidences[[dat[i,"disease"]]], inc_other>=dat[i,"target_inc_o.0.5"]) %>% summarise(equiv_age = min(age)) %>% pull(equiv_age)
+
+}
+dat <- cbind(dat, equiv_age_f.2, equiv_age_m.2, equiv_age_o.2, 
+                  equiv_age_f.3, equiv_age_m.3, equiv_age_o.3,
+                  equiv_age_f.0.5, equiv_age_m.0.5, equiv_age_o.0.5)
+dat <- mutate(dat, OR = exp(beta))
+
+# Need a maximum screening age for each disease - had previously assumed that this would be 80 for all diseases, but now have some disease-specific maximum ages 
+dat <- mutate(dat, last_screen_age = ifelse(disease %in% c("AAA", "AF", "HCAD_MIE"), 75, 
+                                            ifelse(disease=="BC", 74, 
+                                                   ifelse(disease=="CRC", 79,
+                                                          ifelse(disease=="PC", 69,
+                                                                 ifelse(disease=="T2D", 70, 80))))))
+
+write.table(dat, file = paste0("ClinBen_RAP_equivalent_ages_for_all_diseases_with_",low,"_risk_", mysire, "_", Sys.Date(), ".csv"), sep = ",", row.names = F, col.names = T, quote = F)
+      
+
+# The plots
+inc_plots <- list()
+for(i in seq_along(dat$disease)) {
+    this_disease <- dat[i, "disease"]
+    inc_plots[[i]] <-  f_inc_plots(baseline = baseline_incidences[[this_disease]], df = dat[i,])
+}
+names(inc_plots) <- dat$disease
+saveRDS(inc_plots, file = paste0("HI_diseases_all_incidence_plots_with_equiv_lines_and_low_risk_",low,"_", mysire, "_", Sys.Date(), ".RDS"))
+
+ggsave(wrap_plots(inc_plots, ncol=3, byrow=TRUE, guides = "collect") & theme(legend.position = "bottom"), 
+       filename = paste0("HI_diseases_all_incidence_plots_with_equiv_lines_with_",low,"_risk_", mysire, "_", Sys.Date(), ".png"), width = 9, height =12 , dpi = 300)
+     
+print(wrap_plots(inc_plots, ncol=3, byrow=TRUE, guides = "collect") & theme(legend.position = "bottom"))
+
+
+#### shorter version for the paper with HCAD_MIE renamed, without OC and without the additional age0 versions, which are in a supplementary version
+if(mysire=="White") {
+  inc_plots_main <- inc_plots[c(1,3,4,7,8,10,11)] # these include BC40 and CAD40 and CRC 50
+  inc_plots_sup <- inc_plots[c(2,5,6)] # these were for BC50, CRC45 and CAD50, but now those are in the main
+} else if(mysire=="Black") {
+  inc_plots_main <- inc_plots[c(2,3,6,7,8,9)] # these include BC40 and CAD40 and CRC 50
+  inc_plots_sup <- inc_plots[c(1,4,5)] # these are BC50 and HCAD50 and CRC 45
+}
+
+myheight <- 10
+if(mysire=="Black") myheight <- 7
+inc_plots_main[["HCAD_MIE"]] <- inc_plots_main[["HCAD_MIE"]] + labs(subtitle = "CAD")
+ggsave(wrap_plots(inc_plots_main, ncol=3, byrow=TRUE, guides = "collect") & theme(legend.position = "bottom"), 
+        filename = paste0("HI_diseases_all_incidence_plots_main_fig_",low,"_", mysire, "_", Sys.Date(), ".png"), width = 9, height = myheight , dpi = 300)
+
+inc_plots_sup[["HCAD_MIE"]] <- inc_plots_sup[["HCAD_MIE"]] + labs(subtitle = "CAD")
+ggsave(wrap_plots(inc_plots_sup, ncol=3, byrow=TRUE, guides = "collect") & theme(legend.position = "bottom"), 
+        filename = paste0("HI_diseases_all_incidence_plots_supp_fig_",low,"_", mysire, "_", Sys.Date(), ".png"), width = 9, height = 4 , dpi = 300)
+#### 
+
+kable(select(dat, disease, age0, OR, minprs.2:prop.0.5, starts_with("equiv_age")), 
+      format="simple", 
+      caption = paste0("Ages at which risk in higher risk groups is the same as the mean population risk at reference age\nLow risk group is for OR below ",low), digits = c(0,0,rep(2,4),rep(3,3),rep(0,9)))
+
+# slimmed version
+dat <- mutate(dat, equiv_age_o.2 = ifelse(sex=="female", equiv_age_f.2, ifelse(sex=="male", equiv_age_m.2, equiv_age_o.2)),
+              equiv_age_o.3 = ifelse(sex=="female", equiv_age_f.3, ifelse(sex=="male", equiv_age_m.3, equiv_age_o.3)),
+              equiv_age_o.0.5 = ifelse(sex=="female", equiv_age_f.0.5, ifelse(sex=="male", equiv_age_m.0.5, equiv_age_o.0.5)))
+dat <- mutate(dat, rap2 = age0 - equiv_age_o.2, rap3 = age0 - equiv_age_o.3, rap0.5 = age0 - equiv_age_o.0.5)
+dat <- mutate(dat, low_risk_trunc = ifelse(is.infinite(rap0.5), "yes", ""),
+                   rap0.5 = ifelse(is.infinite(rap0.5), age0 - last_screen_age, rap0.5))
+
+kable(select(dat, disease, age0, OR, prop.2:prop.0.5, starts_with("equiv_age_o"), starts_with("rap"), low_risk_trunc), 
+      format="simple", 
+      caption = paste0("Ages at which risk in higher risk groups is the same as the mean population risk at reference age\nslimmed version\nLow risk group is for OR below ",low), digits = c(0,0,rep(2,1),rep(3,3), rep(0,7)))
+
+
+write.table(select(dat, disease, age0, OR, prop.2:prop.0.5, starts_with("equiv_age_o"), starts_with("rap")), 
+            file = paste0("HI_diseases_all_equivalent_ages_and_RAP_", low, "_", mysire, "_", Sys.Date(), ".csv"), 
+            sep = ",", row.names = FALSE, col.names = TRUE, quote = FALSE)
+```
+
+
+#### Randomly sample from truncated normal distribution
+For input to the IRT calculator, create a file of as dummy individuals selected from the distribution of PRS in the high PRS group
+
+
+```{r sample high PRS, eval = FALSE}
+
+nsamples <- 10000
+
+dat <- fread(file = paste0("ClinBen_RAP_equivalent_ages_for_all_diseases_with_",low,"_risk_", mysire, "_", Sys.Date(), ".csv"), data.table = FALSE) 
+
+
+# High Risk group
+mini <- dat %>% 
+  mutate(equiv_age = ifelse(!is.infinite(equiv_age_o.2), equiv_age_o.2, ifelse(!is.infinite(equiv_age_f.2), equiv_age_f.2, equiv_age_m.2)), 
+         period = age0 - equiv_age) %>%
+  mutate(filename = paste0("random_sampled_high_PRS_2_", disease, "_RAP_age_", equiv_age, "_N_", nsamples, ".csv")) %>%
+ select(disease, glon, beta, age0, equiv_age, period, filename)
+
+# High risk group 
+for(i in seq_along(mini$disease)) {
+  my_equiv_age <- mini[i, "equiv_age"]
+  if(dat[i,"sex"]=="other") {
+    female <- data.frame(age = my_equiv_age, prs = truncnorm::rtruncnorm(n=nsamples/2, a = dat[i, "minprs.2"]), sex = "female")
+    male <- data.frame(age = my_equiv_age, prs = truncnorm::rtruncnorm(n=nsamples/2, a = dat[i, "minprs.2"]), sex = "male")
+    dummy <- rbind(male, female)
+  } else if(dat[i,"sex"]=="male") {
+    dummy <- data.frame(age = my_equiv_age, prs = truncnorm::rtruncnorm(n=nsamples, a = dat[i, "minprs.2"]), sex = "male")
+  } else if(dat[i,"sex"]=="female") {
+    dummy <- data.frame(age = my_equiv_age, prs = truncnorm::rtruncnorm(n=nsamples, a = dat[i, "minprs.2"]), sex = "female")
+  }
+  dummy <- dummy %>% arrange(prs) %>% mutate(IID = 1:nsamples, prs_ancestry = "EUR", sire = "WHITE_NONHISP_SIRE") %>% 
+    select(IID, age, sex, sire, prs, prs_ancestry)
+  if(mini$disease[i]=="AAA") dummy <- mutate(dummy, sire = "WHITE_SIRE") # need to use this for AAA to match the baselines
+  write.table(dummy, file = mini[i, "filename"], sep = ",", row.names = FALSE, col.names = TRUE, quote = FALSE)
+}
+
+
+# The Very High Risk Group
+
+mini3 <- dat %>% # just for the lines to go into the IRT calculator
+  mutate(equiv_age = ifelse(!is.infinite(equiv_age_o.3), equiv_age_o.3, ifelse(!is.infinite(equiv_age_f.3), equiv_age_f.3, equiv_age_m.3)), 
+         period = age0 - equiv_age) %>%
+  mutate(filename = paste0("random_sampled_high_PRS_3_", disease, "_RAP_age_", equiv_age, "_N_", nsamples, ".csv")) %>%
+ select(disease, glon, beta, age0, equiv_age, period, filename)
+
+# Very High risk group 
+for(i in seq_along(mini3$disease)) {
+  my_equiv_age <- mini3[i, "equiv_age"]
+  if(dat[i,"sex"]=="other") {
+    female <- data.frame(age = my_equiv_age, prs = truncnorm::rtruncnorm(n=nsamples/2, a = dat[i, "minprs.3"]), sex = "female")
+    male <- data.frame(age = my_equiv_age, prs = truncnorm::rtruncnorm(n=nsamples/2, a = dat[i, "minprs.3"]), sex = "male")
+    dummy <- rbind(male, female)
+  } else if(dat[i,"sex"]=="male") {
+    dummy <- data.frame(age = my_equiv_age, prs = truncnorm::rtruncnorm(n=nsamples, a = dat[i, "minprs.3"]), sex = "male")
+  } else if(dat[i,"sex"]=="female") {
+    dummy <- data.frame(age = my_equiv_age, prs = truncnorm::rtruncnorm(n=nsamples, a = dat[i, "minprs.3"]), sex = "female")
+  }
+  dummy <- dummy %>% arrange(prs) %>% mutate(IID = 1:nsamples, prs_ancestry = "EUR", sire = "WHITE_NONHISP_SIRE") %>% 
+    select(IID, age, sex, sire, prs, prs_ancestry)
+  if(mini3$disease[i]=="AAA") dummy <- mutate(dummy, sire = "WHITE_SIRE") # need to use this for AAA to match the baselines
+  write.table(dummy, file = mini3[i, "filename"], sep = ",", row.names = FALSE, col.names = TRUE, quote = FALSE)
+}
+
+
+# The low risk group
+mini <- dat %>% 
+  mutate(equiv_age = ifelse(!is.infinite(equiv_age_o.0.5), equiv_age_o.0.5, 
+                            ifelse(!is.infinite(equiv_age_f.0.5), equiv_age_f.0.5, 
+                                   ifelse(!is.infinite(equiv_age_m.0.5), equiv_age_m.0.5, last_screen_age))), # set to 80 if infinite 
+                     period = equiv_age - age0) %>%
+  mutate(filename = paste0("random_sampled_high_PRS_",low,"_", disease, "_RAP_age_", age0, "_N_", nsamples, ".csv")) %>%
+  select(disease, glon, beta, age0, equiv_age, period, filename)
+# need to change a few by hand where there are alternate starting ages
+mini <- mutate(mini, filename = ifelse(disease=="BC" & age0==40, paste0("random_sampled_high_PRS_",low,"_", disease, "_40_RAP_age_", age0, "_N_", nsamples, ".csv"), filename))
+mini <- mutate(mini, filename = ifelse(disease=="CRC" & age0==45, paste0("random_sampled_high_PRS_",low, "_", disease, "_45_RAP_age_", age0, "_N_", nsamples, ".csv"), filename))
+mini <- mutate(mini, filename = ifelse(disease=="HCAD_MIE_40" & age0==40, paste0("random_sampled_high_PRS_",low,"_", disease, "_40_RAP_age_", age0, "_N_", nsamples, ".csv"), filename))
+
+for(i in seq_along(mini$disease)) {
+  my_age0 <- mini[i, "age0"]
+  if(dat[i,"sex"]=="other") {
+    female <- data.frame(age = my_age0, prs = truncnorm::rtruncnorm(n=nsamples/2, b = dat[i, "minprs.0.5"]), sex = "female")
+    male <- data.frame(age = my_age0, prs = truncnorm::rtruncnorm(n=nsamples/2, b = dat[i, "minprs.0.5"]), sex = "male")
+    dummy <- rbind(male, female)
+  } else if(dat[i,"sex"]=="male") {
+    dummy <- data.frame(age = my_age0, prs = truncnorm::rtruncnorm(n=nsamples, b = dat[i, "minprs.0.5"]), sex = "male")
+  } else if(dat[i,"sex"]=="female") {
+    dummy <- data.frame(age = my_age0, prs = truncnorm::rtruncnorm(n=nsamples, b = dat[i, "minprs.0.5"]), sex = "female")
+  }
+  dummy <- dummy %>% arrange(prs) %>% mutate(IID = 1:nsamples, prs_ancestry = "EUR", sire = "WHITE_NONHISP_SIRE") %>% 
+    select(IID, age, sex, sire, prs, prs_ancestry)
+  if(mini$disease[i]=="AAA") dummy <- mutate(dummy, sire = "WHITE_SIRE") # need to use this for AAA to match the baselines
+  write.table(dummy, file = mini[i, "filename"], sep = ",", row.names = FALSE, col.names = TRUE, quote = FALSE)
+}
+
+```
+
+
+#### Run the IRT calculator for each disease and for each risk group (high, very high and low) - outside of this script
+
+
+```{r output from IRT calculator}
+
+hr_df <- fread(file = "ClinBen_prs_effect_sizes.csv", data.table = FALSE)
+hr_df <- filter(hr_df, trait_code %in% c(disease, "EOC", "HCAD_PRSmie") & Ancestry=="EUR") %>% select(trait_code, lnOdds:UCI)
+hr_df <- mutate(hr_df, trait_code = ifelse(trait_code=="EOC", "OC", ifelse(trait_code=="HCAD_PRSmie", "HCAD_MIE", trait_code)))
+hr_df <- mutate(hr_df, oddsratio_mean = exp(lnOdds), oddsratio_lci = exp(LCI), oddsratio_uci = exp(UCI))
+
+# Make the extra rows for the secondary reference ages
+hr_df["BC_40",] <- hr_df[hr_df$trait_code=="BC", ]
+hr_df["BC_40", "trait_code"] <- "BC_40"
+hr_df["CRC_45",] <- hr_df[hr_df$trait_code=="CRC", ]
+hr_df["CRC_45", "trait_code"] <- "CRC_45"
+hr_df["HCAD_MIE_40",] <- hr_df[hr_df$trait_code=="HCAD_MIE", ]
+hr_df["HCAD_MIE_40", "trait_code"] <- "HCAD_MIE_40"
+
+
+# function to estimate 95% CI of mean risk in high risk group, based on multiplying the mean odds in the high risk group by the ratio of the E[RR | high risk group] based on the CI of the estimated PRS beta to the best estimate of the PRS beta, where the E[RR | high risk group] are estimated in the function f_expected_RR
+f_get_ci <- function(sex = "other", meanrisk, odds_ratios) {
+  odds <- meanrisk / (1 - meanrisk)
+  or_mean <- odds_ratios[1]
+  or_lci <- odds_ratios[2]
+  or_uci <- odds_ratios[3]
+  odds_lci <- (or_lci / or_mean) * odds
+  odds_uci <- (or_uci / or_mean) * odds
+  lci <- odds_lci / (1 + odds_lci)
+  uci <- odds_uci / (1 + odds_uci)
+  if(sex=="other") { # make it so that the first entry is the female (sex=0) and the second is make (sex=1)
+    return(list(lci = lci, uci = uci))
+  } else if(sex=="female") {
+    return(list(lci = c(lci,NA), uci = c(uci,NA)))
+  } else if(sex=="male") {
+    return(list(lci = c(NA, lci), uci = c(NA, uci)))
+  }
+}
+
+dat <- fread(file = paste0("ClinBen_RAP_equivalent_ages_for_all_diseases_with_",low,"_risk_", mysire, "_", Sys.Date(), ".csv"), data.table = FALSE)
+dat <- mutate(dat, disease = ifelse(disease %in% c("BC", "CRC", "HCAD_MIE") & age0!=50, paste0(disease, "_", age0), disease))
+
+
+riskgroups <- c("high2", "veryhigh3", "low")
+ext <- c("", "_3", "_low") # because the subdirectories for the RR>3 (very high risk) version are called e,g, BC_3
+titletext <- c("High risk, RR>2", "Very high risk, RR>3", paste0("Low risk, RR<",low))
+
+for(k in seq_along(riskgroups)) {
+  out_risk <- list()
+  out_base <- list()
+  for(i in seq_along(dat$disease)) {
+    irt <- fread(file = paste0(dat[i,"disease"], ext[k], "/mini_irt_scores.csv"), data.table = FALSE)
+    out_risk[[i]] <- irt %>% group_by(sex) %>% 
+      summarise(age = mean(age), duration = first(risk_duration), mean_prs = mean(prs), mean_risk = mean(irt_score)) %>% 
+      mutate(disease = dat[i, "disease"])
+      beta_and_ci <- filter(hr_df, trait_code==dat[i, "disease"]) %>% select(lnOdds:UCI)
+      if(riskgroups[k] == "high2") {
+        odds_ratios <- f_expected_RR(beta = t(beta_and_ci), prop = filter(dat, disease==dat[i,"disease"]) %>% pull(prop.2), high_or_low = "high")
+      } else if(riskgroups[k] == "veryhigh3") {
+        odds_ratios <- f_expected_RR(beta = t(beta_and_ci), prop = filter(dat, disease==dat[i,"disease"]) %>% pull(prop.3), high_or_low = "high")
+      } else if(riskgroups[k] == "low") {
+        odds_ratios <- f_expected_RR(beta = t(beta_and_ci), prop = filter(dat, disease==dat[i,"disease"]) %>% pull(prop.0.5), high_or_low = "low")
+      }
+      my_ci <- f_get_ci(sex = dat[i, "sex"], meanrisk = pull(out_risk[[i]], mean_risk), c(odds_ratios))
+      out_risk[[i]] <- mutate(out_risk[[i]], lci = ifelse(sex=="male", my_ci$lci[2], my_ci$lci[1]), uci = ifelse(sex=="male", my_ci$uci[2], my_ci$uci[1]))
+    
+    baseline <- fread(file = paste0(dat[i,"disease"], ext[k], "/mini_baseline_scores.csv"), data.table = FALSE)
+    out_base[[i]] <- baseline %>% group_by(sex) %>% 
+      summarise(age = mean(age), duration = first(risk_duration), mean_prs = mean(prs), mean_risk = mean(irt_score)) %>% 
+      mutate(disease = dat[i, "disease"])
+ # don't need CI for mean baseline risk, because it is, by definition, the same for everyone
+  }
+
+  out_risk <- bind_rows(out_risk) %>% select(disease, sex, risk_age = age, duration, mean_prs_high = mean_prs, 
+                                             mean_risk_high = mean_risk, lci_risk_high = lci, uci_risk_high = uci)
+  out_risk <- mutate(out_risk, duration = stringr::str_remove(duration, "fixed_interval:")) %>% rename(RAP = duration) %>% mutate(RAP = as.numeric(RAP))
+  out_risk <- mutate(out_risk, yr_mean_risk_high = mean_risk_high / RAP, 
+                               yr_lci_risk_high = lci_risk_high / RAP, 
+                               yr_uci_risk_high = uci_risk_high / RAP)
+
+  out_base <- bind_rows(out_base) %>% select(disease, sex, population_risk = mean_risk)
+  out_both <- left_join(out_risk, out_base, by = c("disease", "sex"))
+
+  if(riskgroups[k]=="high2") {
+    out_both <- left_join(out_both, select(dat, disease, age0, proportion_high = prop.2), by = "disease") # high risk version
+  } else if(riskgroups[k]=="veryhigh3") {
+    out_both <- left_join(out_both, select(dat, disease, age0, proportion_high = prop.3), by = "disease") # very high risk version    
+  } else if(riskgroups[k]=="low") {
+    out_both <- left_join(out_both, select(dat, disease, age0, proportion_high = prop.0.5), by = "disease") # low risk version    
+  }
+  out_both <- mutate(out_both, fold_increase = mean_risk_high / population_risk, 
+                          cases_high_per_100k = proportion_high*mean_risk_high*100000,
+                          cases_high_per_100k_lci = proportion_high*lci_risk_high*100000,
+                          cases_high_per_100k_uci = proportion_high*uci_risk_high*100000)
+  out_both <- relocate(out_both, disease, sex, age0, proportion_high, risk_age)
+  out_both <- mutate(out_both, cases_all_per_100k = 100000*population_risk, 
+                               pc_cases_in_high = 100*cases_high_per_100k / cases_all_per_100k, 
+                               cases_in_random = cases_all_per_100k*proportion_high)
+  
+
+# note that the 10000 in the file names refers to the number of high risk or very high risk people in the simulation, not to a population size
+  if(riskgroups[k]=="high2") {
+    out_high_risk <- out_both
+    print(knitr::kable(out_high_risk, format="simple", 
+        caption = paste0("Summary results of RAP-based analyses with 10000 random PRSs\n", titletext[k]), 
+        digits = c(rep(0,3), 3, rep(0,2), 2, rep(4,7), 2, rep(1,6))))
+    write.table(out_high_risk, file = "high_risk_mean_irt_risk_10000_with_CI.csv", sep = ",", row.names = FALSE) 
+  } else if(riskgroups[k]=="veryhigh3") {
+    out_very_high_risk <- rename(out_both, proportion_very_high = proportion_high, mean_prs_vhigh = mean_prs_high, 
+                                 yr_mean_risk_vhigh = yr_mean_risk_high,    
+                                 yr_lci_risk_vhigh = yr_lci_risk_high, 
+                                 yr_uci_risk_vhigh = yr_uci_risk_high, 
+                                 mean_risk_vhigh = mean_risk_high,    
+                                 lci_risk_vhigh = lci_risk_high, 
+                                 uci_risk_vhigh = uci_risk_high, 
+                                 cases_vhigh_per_100k = cases_high_per_100k,
+                                 cases_vhigh_per_100k_lci = cases_high_per_100k_lci,
+                                 cases_vhigh_per_100k_uci = cases_high_per_100k_uci,
+                                 pc_cases_in_vhigh = pc_cases_in_high)
+    print(knitr::kable(out_very_high_risk, format="simple", 
+        caption = paste0("Summary results of RAP-based analyses with 10000 random PRSs\n", titletext[k]), 
+        digits = c(rep(0,3),3, rep(0,2),2, rep(4,7), 2, rep(1,6))))
+    write.table(out_very_high_risk, file = "very_high_risk_mean_irt_risk_10000_with_CI.csv", sep = ",", row.names = FALSE)
+  } else if(riskgroups[k] %in% c("low", "0.25")) {
+    out_low_risk <- rename(out_both, proportion_low = proportion_high, mean_prs_low = mean_prs_high, 
+                           yr_mean_risk_low = yr_mean_risk_high,    
+                           yr_lci_risk_low = yr_lci_risk_high, 
+                           yr_uci_risk_low = yr_uci_risk_high, 
+                           mean_risk_low = mean_risk_high, 
+                           lci_risk_low = uci_risk_high, # LCI and UCI are reversed for the low risk group
+                           uci_risk_low = lci_risk_high, 
+                           cases_low_per_100k = cases_high_per_100k, 
+                           cases_low_per_100k_lci = cases_high_per_100k_uci, # LCI and UCI are reversed for the low risk group
+                           cases_low_per_100k_uci = cases_high_per_100k_lci, 
+                           pc_cases_in_low = pc_cases_in_high)
+    out_low_risk <- relocate(out_low_risk, disease:yr_uci_risk_low, population_risk:cases_low_per_100k, cases_low_per_100k_lci, cases_low_per_100k_uci, cases_all_per_100k:cases_in_random)
+    out_low_risk <- mutate(out_low_risk, risk_age = age0 + RAP, RAP = (-1)*RAP)
+    print(knitr::kable(out_low_risk, format="simple", 
+        caption = paste0("Summary results of RAP-based analyses with 10000 random PRSs\n", titletext[k]), 
+        digits = c(rep(0,3),3, rep(0,2),2, rep(4,7), 2, rep(1,6))))
+    write.table(out_low_risk, file = paste0("low_",low,"_risk_mean_irt_risk_10000_with_CI.csv"), sep = ",", row.names = FALSE)
+  }
+  
+  
+}
+
+```
+
+### Notes
+
+age0 is the reference age for that disease (same for male/female). 
+
+proportion_high is the proportion of the population predicted to be in the High Risk (OR>2) group.  
+
+risk_age is the age at which the High Risk group has incidence equivalent to the population mean incidence at age0 (same for male/female).  
+
+duration is the RAP (same for male/female).  
+
+mean_prs_high is the mean of the PRS in the High Risk group (those with OR vs population mean of at least 2), from simulations.  
+
+mean_risk_high is the mean predicted n-year risk for someone with the given ethnicity in the High Risk group, beginning at risk_age, and where n is the RAP, in years. Ie. the predicted incidence between the RAP age and the reference age.  For example, the predicted 9-year risk of AF for a 51-year old in the High Risk group.  
+
+The mean_risk_high is calculating using our internal IRT calculator program. This calculates the risk of a person getting a disease over some time window, given that they were alive and disease-free at the start of the window. It allows for competing risks (mortality), and uses a population baseline risk which can be modulated by the value of a given risk factor (in this case, PRS), such that the mean risk over the full distribution of the risk factor remains equal to the population mean. It is based on the Gail model, initially published for breast cancer risk, but can be generalised for any disease for which baseline population rates are available.  
+
+yr_mean_risk_high is the average risk per year in the High risk group i.e. mean_risk_high / RAP
+
+population_risk is the mean population risk over the same period e.g. the predicted mean 9-year risk of AF for any 51 year-old.  
+
+fold_increase is just the ratio of these two.  
+
+cases_high_per_100k is the product of proportion_high and mean_risk_high x100000. This would be the predicted number of cases which would occur in the High Risk group between risk_age and age0 among a hyothetical population of 100,000 unaffected people at the younger age (of that sex, if it is a sex-specific disease), that is, 100k per age/sex combination).
+
+cases_all_per_100k  is simply the 100000*population_risk i.e. the cases what would be expected to occur in the whole hypothetical population over this time period.
+
+pc_cases_in_high is the % of all the cases in the population occuring during the RAP which would be expected to occur in the High Risk group =  100*cases_high_per_100k / cases_all_per_100k, 
+
+cases_in_random is the cases which would be expected to occur in a randomly sampled subset of the general population, where the proportion sampled is the same as the proportion predicted to be in the High Risk group. I.e. cases_all_per_100k*proportion_high
