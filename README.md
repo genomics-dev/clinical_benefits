@@ -1,0 +1,1 @@
+R Markdown code for the calculation of the risk advancement period (RAP) estimates presented in the paper "Preventing premature deaths through polygenic risk scores" by Chuong et al, Nature Communications 2025.
